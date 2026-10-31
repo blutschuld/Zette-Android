@@ -1,5 +1,55 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 제때 디자인 토큰: 색상 (라이트 모드). Figma "Color" 변수와 이름을 맞춤 (green/brand → green_brand). -->
 <resources>
-    <color name="black">#FF000000</color>
-    <color name="white">#FFFFFFFF</color>
+
+    <!-- green -->
+    <color name="green_brand">#006241</color>
+    <color name="green_accent">#00754A</color>
+    <color name="green_deep">#1E3932</color>
+    <color name="green_mid">#2B5148</color>
+    <color name="green_mint">#D4E9E2</color>
+
+    <!-- surface -->
+    <color name="surface_canvas">#F2F0EB</color>
+    <color name="surface_container">#FFFFFF</color>
+    <color name="surface_raised">#FFFFFF</color>
+    <color name="surface_cool">#F9F9F9</color>
+    <color name="surface_ceramic">#EDEBE9</color>
+    <color name="surface_ink">#000000</color>
+
+    <!-- text -->
+    <color name="text_primary">#DE000000</color>
+    <color name="text_secondary">#94000000</color>
+    <color name="text_disabled">#61000000</color>
+    <color name="text_on_accent">#FFFFFF</color>
+    <color name="text_on_ink">#FFFFFF</color>
+    <color name="text_on_error">#FFFFFF</color>
+    <color name="text_on_dark">#FFFFFF</color>
+    <color name="text_on_dark_soft">#B2FFFFFF</color>
+
+    <!-- border -->
+    <color name="border_input">#D6DBDE</color>
+    <color name="border_hairline">#E7E7E7</color>
+
+    <!-- semantic -->
+    <color name="semantic_error">#C82014</color>
+    <color name="semantic_warning">#FBBC05</color>
+    <color name="semantic_success">#00754A</color>
+    <color name="semantic_valid_tint">#54D4E9E2</color>
+    <color name="semantic_error_tint">#0DC82014</color>
+
+    <!-- state -->
+    <color name="state_disabled_fill">#1F000000</color>
+    <color name="state_handle">#33000000</color>
+    <color name="state_scrim">#80000000</color>
+    <color name="state_pressed_on_dark">#1AFFFFFF</color>
+
+    <!-- static -->
+    <color name="static_white">#FFFFFF</color>
+    <color name="static_accent">#00754A</color>
+    <color name="static_mint">#D4E9E2</color>
+
+    <!-- transit -->
+    <color name="transit_bus">#2F6FDE</color>
+    <color name="transit_subway">#7B4FC9</color>
 </resources>
