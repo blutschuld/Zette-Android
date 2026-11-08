@@ -15,6 +15,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 //경도 위도를 반환하거나, 오류값 반환
+//api 24버전까지 만들것!
 @RequiresApi(30)
 public final class GpsReader {
 
