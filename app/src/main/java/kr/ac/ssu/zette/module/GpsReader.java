@@ -1,4 +1,4 @@
-package com.example.myapplication;
+package kr.ac.ssu.zette;
 
 import android.Manifest;
 import android.content.Context;
@@ -7,8 +7,11 @@ import android.location.Location;
 import android.location.LocationManager;
 import android.os.CancellationSignal;
 import android.os.Looper;
+import android.util.Log;
 
-import androidx.annotation.RequiresApi;
+import android.location.LocationListener;
+import android.os.Build;
+import android.os.Bundle;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -16,7 +19,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 //경도 위도를 반환하거나, 오류값 반환
 //api 24버전까지 만들것!
-@RequiresApi(30)
+
 public final class GpsReader {
 
     //성공 or 에러코드
@@ -60,9 +63,10 @@ public final class GpsReader {
     public Result read(long timeoutMillis) {
         //시스템 상태 확인
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            throw new IllegalStateException(
-                    "GpsReader.read()는 보조 스레드에서 호출해야 합니다."
-            );
+//            throw new IllegalStateException(GpsReader.read()는 보조 스레드에서 호출해야 합니다.
+//                    ""
+//            );
+            Log.w("module", "GpsReader.read()는 보조 스레드에서 호출해야 합니다.");
         }
 
         if (timeoutMillis <= 0) {
@@ -80,6 +84,11 @@ public final class GpsReader {
                 Manifest.permission.ACCESS_FINE_LOCATION
         ) != PackageManager.PERMISSION_GRANTED) {
             return new Result(ERROR_PERMISSION, null);
+        }
+
+        //sdk24 호환 함수로 넘기기
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.R) {
+            return readLegacy(timeoutMillis);
         }
 
         CancellationSignal cancellation = new CancellationSignal();
@@ -127,12 +136,95 @@ public final class GpsReader {
             Thread.currentThread().interrupt();
             return new Result(ERROR_INTERRUPTED, null);
 
-        } catch (IllegalArgumentException | IllegalStateException e) {
+        } catch (IllegalArgumentException e) {
             return new Result(ERROR_UNAVAILABLE, null);
 
         } finally {
             // 시간 초과나 인터럽트가 발생해도 위치 요청을 정리합니다.
             cancellation.cancel();
+        }
+    }
+
+    //sdk24 호환 함수
+    private Result readLegacy(long timeoutMillis) {
+        // 결과는 메인 스레드로 전달되므로 호출한 쪽은 보조 스레드여야 합니다.
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+//            return new Result(ERROR_UNAVAILABLE, null);
+            Log.w("module", "sdk24: GpsReader.read()는 보조 스레드에서 호출해야 합니다.");
+        }
+
+        if (context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            return new Result(ERROR_PERMISSION, null);
+        }
+
+        String provider = LocationManager.GPS_PROVIDER;
+        CountDownLatch completed = new CountDownLatch(1);
+        AtomicReference<Result> received = new AtomicReference<>();
+
+        LocationListener listener = new LocationListener() {
+            private void finish(Result result) {
+                if (received.compareAndSet(null, result)) {
+                    completed.countDown();
+                }
+            }
+
+            @Override
+            public void onLocationChanged(Location location) {
+                if (location == null) {
+                    finish(new Result(ERROR_NO_LOCATION, null));
+                } else {
+                    finish(new Result(SUCCESS, new Location(location)));
+                }
+            }
+
+            @Override
+            public void onProviderDisabled(String provider) {
+                finish(new Result(ERROR_GPS_DISABLED, null));
+            }
+
+            @Override
+            public void onProviderEnabled(String provider) {
+            }
+
+            @Override
+            public void onStatusChanged(String provider, int status, Bundle extras) {
+            }
+        };
+
+        boolean registered = false;
+
+        try {
+            if (!locationManager.getAllProviders().contains(provider)) {
+                return new Result(ERROR_UNAVAILABLE, null);
+            }
+
+            if (!locationManager.isProviderEnabled(provider)) {
+                return new Result(ERROR_GPS_DISABLED, null);
+            }
+
+            locationManager.requestLocationUpdates(
+                    provider, 0L, 0f, listener, Looper.getMainLooper()
+            );
+            registered = true;
+
+            if (!completed.await(timeoutMillis, TimeUnit.MILLISECONDS)) {
+                return new Result(ERROR_TIMEOUT, null);
+            }
+
+            return received.get();
+
+        } catch (SecurityException e) {
+            return new Result(ERROR_PERMISSION, null);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new Result(ERROR_INTERRUPTED, null);
+        } catch (IllegalArgumentException e) {
+            return new Result(ERROR_UNAVAILABLE, null);
+        } finally {
+            if (registered) {
+                locationManager.removeUpdates(listener);
+            }
         }
     }
 }
