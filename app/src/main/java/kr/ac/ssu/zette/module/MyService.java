@@ -1,81 +1,171 @@
 package kr.ac.ssu.zette;
 
+import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.database.ContentObserver;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
+import android.os.ResultReceiver;
+import android.provider.CalendarContract;
+import android.util.Log;
 
-/**
- * Manifest에 .MyService을 등록하고 stopWithTask="false"를 설정한다.
- * FOREGROUND_SERVICE 권한과 실제 작업에 맞는 서비스 유형 및 권한도 선언한다.
- * 화면에 표시된 Activity에서 API 26 이상은 startForegroundService(),
- * API 25 이하는 startService()로 시작한다.
- */
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 public class MyService extends Service {
+    public static final String ACTION_REQUEST_INFO = "kr.ac.ssu.zette.action.REQUEST_INFO";
+    public static final String EXTRA_EVENT_ID = "kr.ac.ssu.zette.extra.EVENT_ID";
+    public static final String EXTRA_INFO_RECEIVER = "kr.ac.ssu.zette.extra.INFO_RECEIVER";
+
+    private static final String TAG = "MyService";
     private static final String CHANNEL_ID = "my_service";
     private static final int NOTIFICATION_ID = 1001;
+    private static final long CHECK_INTERVAL_MILLIS = TimeUnit.MINUTES.toMillis(10);
+
+    private ExecutorService worker;
+    private ExecutorService infoWorker;
+    private GpsReader gpsReader;
+    private CheckerThread.RouteSource infoRoutes;
+    private CheckerThread checker;
+    // 확인 요청과 완료 상태는 메인 스레드에서 관리한다.
+    private final Handler checkerHandler = new Handler(Looper.getMainLooper());
+    private final Runnable checkRequest = this::requestCheck;
+    private ContentObserver calendarObserver;
+    private boolean checkerStarted;
+    private boolean checkRunning;
+    private boolean checkRequested;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        worker = Executors.newSingleThreadExecutor();
+        infoWorker = Executors.newSingleThreadExecutor();
+        gpsReader = new GpsReader(getApplicationContext());
+        infoRoutes = createRouteSource();
+        checker = new CheckerThread(getApplicationContext(), gpsReader, createRouteSource());
+    }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        ResultReceiver infoReceiver = intent != null && ACTION_REQUEST_INFO.equals(intent.getAction())
+                ? intent.getParcelableExtra(EXTRA_INFO_RECEIVER) : null;
+        String eventId = infoReceiver == null ? null : intent.getStringExtra(EXTRA_EVENT_ID);
+
+        boolean hasFineLocation = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED;
+        boolean hasCoarseLocation = checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED;
+        if (!hasFineLocation && !hasCoarseLocation) {
+            Log.w(TAG, "위치 권한이 없어 서비스를 종료합니다.");
+            if (infoReceiver != null) {
+                InfoThread.sendError(infoReceiver, InfoThread.LOCATION_UNAVAILABLE, eventId);
+            }
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
         startForeground(NOTIFICATION_ID, createNotification());
 
-        //업데이트 빈도 컨트롤러 변수
-        int updateController;
+        if (!checkerStarted) {
+            checkerStarted = true;
+            requestCheck();
+        }
 
-        //GpsReader 객체 생성
-        GpsReader gpsReader = new GpsReader(getApplicationContext());
+        if (infoReceiver != null) {
+            infoWorker.execute(new InfoThread(getApplicationContext(), gpsReader,
+                    infoRoutes, eventId, infoReceiver));
+        }
 
-    /**
-     * thred 1
-     *
-     *          //가장 임박한 일정 픽커
-     *
-     *         //위치 확인 및 타임 체커*/
-        Runnable checkerTread = () -> {
-            doWork();        // 오래 걸리는 작업을 백그라운드에서 실행
-
-        };
-
-        new Thread(checkerTread).start();
-
-    /**
-     * thred 2
-     *
-     *         //알람 보내기*/
-        Runnable callerTread = () -> {
-            doWork();        // 오래 걸리는 작업을 백그라운드에서 실행
-
-        };
-
-        new Thread(callerTread).start();
-
-    /**
-     * thred 3
-     *
-     *         //intent리시버? 여튼 ui 통신 액티비티에서 내뱉으면 정보 주면 됨
-     *         //일정 전달 받으면 출발 시간 몇분 남았는지 보내는 함수
-     *         //타야하는 버스(대중교통) 언제 출발하는지 알려주는 함수*/
-        Runnable infoThread = () -> {
-            doWork();        // 오래 걸리는 작업을 백그라운드에서 실행
-        };
-
-        new Thread(infoThread).start();
-
-
-        return START_NOT_STICKY;
+        return START_STICKY;
     }
 
-    //여기서 thread3 관련 정보 연결 할 것
+    /** Activity는 요청마다 주 스레드 Handler를 사용하는 ResultReceiver를 전달한다. */
+    public static Intent createInfoRequest(Context context, String eventId, ResultReceiver receiver) {
+        return new Intent(context, MyService.class).setAction(ACTION_REQUEST_INFO)
+                .putExtra(EXTRA_EVENT_ID, eventId)
+                .putExtra(EXTRA_INFO_RECEIVER, receiver);
+    }
+
+    private void requestCheck() {
+        if (!checkerStarted) return;
+        if (checkRunning) {
+            checkRequested = true;
+            return;
+        }
+        observeCalendar();
+        checkRunning = true;
+        checkerHandler.removeCallbacks(checkRequest);
+        checkerHandler.postDelayed(checkRequest, CHECK_INTERVAL_MILLIS);
+        worker.execute(() -> {
+            try {
+                checker.run();
+            } finally {
+                checkerHandler.post(this::onCheckComplete);
+            }
+        });
+    }
+
+    private void onCheckComplete() {
+        checkRunning = false;
+        if (checkRequested) {
+            checkRequested = false;
+            requestCheck();
+        }
+    }
+
+    private void observeCalendar() {
+        if (calendarObserver != null || checkSelfPermission(Manifest.permission.READ_CALENDAR)
+                != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        ContentObserver observer = new ContentObserver(checkerHandler) {
+            @Override
+            public void onChange(boolean selfChange) {
+                checker.refreshCallers();
+                requestCheck();
+            }
+        };
+        try {
+            getContentResolver().registerContentObserver(CalendarContract.CONTENT_URI, true, observer);
+            calendarObserver = observer;
+        } catch (SecurityException e) {
+            Log.w(TAG, "캘린더 변경 감시를 등록할 수 없습니다.", e);
+        }
+    }
+
+    protected CheckerThread.RouteSource createRouteSource() {
+        return new TransitRouteSource();
+    }
+
+    @Override
+    public void onDestroy() {
+        checkerStarted = false;
+        checkerHandler.removeCallbacks(checkRequest);
+        if (calendarObserver != null) {
+            getContentResolver().unregisterContentObserver(calendarObserver);
+            calendarObserver = null;
+        }
+        // 진행 중인 위치 조회를 인터럽트하면 GpsReader가 위치 요청을 정리한다.
+        checker.close();
+        worker.shutdownNow();
+        infoWorker.shutdownNow();
+        super.onDestroy();
+    }
+
     @Override
     public IBinder onBind(Intent intent) {
         return null;
     }
 
-    //실행 상태 알림 등록
     private Notification createNotification() {
         Notification.Builder builder;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
