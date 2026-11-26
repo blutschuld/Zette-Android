@@ -19,10 +19,14 @@ import android.util.Log;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 public class MyService extends Service {
     public static final String ACTION_REQUEST_INFO = "kr.ac.ssu.zette.action.REQUEST_INFO";
+    public static final String ACTION_REQUEST_CURRENT_EVENT_INFO =
+            "kr.ac.ssu.zette.action.REQUEST_CURRENT_EVENT_INFO";
     public static final String EXTRA_EVENT_ID = "kr.ac.ssu.zette.extra.EVENT_ID";
     public static final String EXTRA_INFO_RECEIVER = "kr.ac.ssu.zette.extra.INFO_RECEIVER";
 
@@ -33,6 +37,7 @@ public class MyService extends Service {
 
     private ExecutorService worker;
     private ExecutorService infoWorker;
+    private ExecutorService realtimeWorker;
     private GpsReader gpsReader;
     private CheckerThread.RouteSource infoRoutes;
     private CheckerThread checker;
@@ -51,12 +56,26 @@ public class MyService extends Service {
         infoWorker = Executors.newSingleThreadExecutor();
         gpsReader = new GpsReader(getApplicationContext());
         infoRoutes = createRouteSource();
-        checker = new CheckerThread(getApplicationContext(), gpsReader, createRouteSource());
+        String busKey = optionalString("zette_realtime_bus_key");
+        String subwayKey = optionalString("zette_realtime_subway_key");
+        RealtimeTransitApi realtime = null;
+        if (!busKey.isEmpty() || !subwayKey.isEmpty()) {
+            realtimeWorker = new ThreadPoolExecutor(6, 6, 0L, TimeUnit.MILLISECONDS,
+                    new ArrayBlockingQueue<>(48));
+            realtime = new RealtimeTransitApi(busKey, subwayKey, realtimeWorker);
+        }
+        checker = new CheckerThread(getApplicationContext(), gpsReader, createRouteSource(), realtime);
+    }
+
+    private String optionalString(String name) {
+        int id = getResources().getIdentifier(name, "string", getPackageName());
+        return id == 0 ? "" : getString(id).trim();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        ResultReceiver infoReceiver = intent != null && ACTION_REQUEST_INFO.equals(intent.getAction())
+        boolean currentRequest = intent != null && ACTION_REQUEST_CURRENT_EVENT_INFO.equals(intent.getAction());
+        ResultReceiver infoReceiver = intent != null && (currentRequest || ACTION_REQUEST_INFO.equals(intent.getAction()))
                 ? intent.getParcelableExtra(EXTRA_INFO_RECEIVER) : null;
         String eventId = infoReceiver == null ? null : intent.getStringExtra(EXTRA_EVENT_ID);
 
@@ -66,7 +85,9 @@ public class MyService extends Service {
                 == PackageManager.PERMISSION_GRANTED;
         if (!hasFineLocation && !hasCoarseLocation) {
             Log.w(TAG, "위치 권한이 없어 서비스를 종료합니다.");
-            if (infoReceiver != null) {
+            if (currentRequest && infoReceiver != null) {
+                InfoThread.currentEventInfo(checker, infoReceiver);
+            } else if (infoReceiver != null) {
                 InfoThread.sendError(infoReceiver, InfoThread.LOCATION_UNAVAILABLE, eventId);
             }
             stopSelf();
@@ -80,7 +101,9 @@ public class MyService extends Service {
             requestCheck();
         }
 
-        if (infoReceiver != null) {
+        if (currentRequest && infoReceiver != null) {
+            InfoThread.currentEventInfo(checker, infoReceiver);
+        } else if (infoReceiver != null) {
             infoWorker.execute(new InfoThread(getApplicationContext(), gpsReader,
                     infoRoutes, eventId, infoReceiver));
         }
@@ -92,6 +115,12 @@ public class MyService extends Service {
     public static Intent createInfoRequest(Context context, String eventId, ResultReceiver receiver) {
         return new Intent(context, MyService.class).setAction(ACTION_REQUEST_INFO)
                 .putExtra(EXTRA_EVENT_ID, eventId)
+                .putExtra(EXTRA_INFO_RECEIVER, receiver);
+    }
+
+    /** 현재 추적 중인 일정 정보를 요청한다. 응답에는 새 GPS·경로 조회를 하지 않는다. */
+    public static Intent currentEventInfo(Context context, ResultReceiver receiver) {
+        return new Intent(context, MyService.class).setAction(ACTION_REQUEST_CURRENT_EVENT_INFO)
                 .putExtra(EXTRA_INFO_RECEIVER, receiver);
     }
 
@@ -143,7 +172,7 @@ public class MyService extends Service {
     }
 
     protected CheckerThread.RouteSource createRouteSource() {
-        return new TransitRouteSource();
+        return new KakaoTransitRouteSource();
     }
 
     @Override
@@ -158,6 +187,7 @@ public class MyService extends Service {
         checker.close();
         worker.shutdownNow();
         infoWorker.shutdownNow();
+        if (realtimeWorker != null) realtimeWorker.shutdownNow();
         super.onDestroy();
     }
 
