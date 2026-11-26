@@ -12,10 +12,12 @@ import android.provider.CalendarContract.Instances;
 import android.util.Log;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -61,18 +63,26 @@ public final class CheckerThread implements Runnable, AutoCloseable {
     public static final class RouteResult {
         final List<Trip> trips;
         final long totalTimeSec;
+        final Long arrivalTimeMillis;
+        final List<kr.ac.ssu.zette.route.RouteResult> alternatives;
+        final kr.ac.ssu.zette.route.RouteResult primaryRoute;
 
         final InfoThread.TransitDetails transit;
 
-        private RouteResult(List<Trip> trips, long totalTimeSec, InfoThread.TransitDetails transit) {
+        private RouteResult(List<Trip> trips, long totalTimeSec, InfoThread.TransitDetails transit,
+                Long arrivalTimeMillis, List<kr.ac.ssu.zette.route.RouteResult> alternatives,
+                kr.ac.ssu.zette.route.RouteResult primaryRoute) {
             this.trips = trips;
             this.totalTimeSec = totalTimeSec;
             this.transit = transit;
+            this.arrivalTimeMillis = arrivalTimeMillis;
+            this.alternatives = alternatives;
+            this.primaryRoute = primaryRoute;
         }
 
         /** 빈 목록은 조건을 충족하는 편이 없다는 조회 결과다. */
         public static RouteResult scheduled(List<Trip> trips) {
-            return new RouteResult(new ArrayList<>(trips), 0L, null);
+            return new RouteResult(new ArrayList<>(trips), 0L, null, null, Collections.emptyList(), null);
         }
 
         public static RouteResult estimate(long totalTimeSec) {
@@ -80,10 +90,21 @@ public final class CheckerThread implements Runnable, AutoCloseable {
         }
 
         public static RouteResult estimate(long totalTimeSec, InfoThread.TransitDetails transit) {
+            return estimate(totalTimeSec, transit, null);
+        }
+
+        public static RouteResult estimate(long totalTimeSec, InfoThread.TransitDetails transit,
+                Long arrivalTimeMillis) {
+            return estimate(totalTimeSec, transit, arrivalTimeMillis, null);
+        }
+
+        static RouteResult estimate(long totalTimeSec, InfoThread.TransitDetails transit,
+                Long arrivalTimeMillis, kr.ac.ssu.zette.route.RouteResult primaryRoute) {
             if (totalTimeSec <= 0 || totalTimeSec > Long.MAX_VALUE / 1000L) {
                 throw new IllegalArgumentException("유효한 이동 시간이 필요합니다.");
             }
-            return new RouteResult(null, totalTimeSec, transit);
+            return new RouteResult(null, totalTimeSec, transit, arrivalTimeMillis,
+                    primaryRoute == null ? Collections.emptyList() : primaryRoute.getAlternatives(), primaryRoute);
         }
     }
 
@@ -94,15 +115,31 @@ public final class CheckerThread implements Runnable, AutoCloseable {
         public final long departAtMillis;
         public final boolean estimated;
         public final InfoThread.TransitDetails transit;
+        public final List<kr.ac.ssu.zette.route.RouteResult> alternatives;
+        final EventItinerary itinerary;
 
         Plan(long eventId, String title, long appointmentMillis,
                 long departAtMillis, boolean estimated, InfoThread.TransitDetails transit) {
+            this(eventId, title, appointmentMillis, departAtMillis, estimated, transit, Collections.emptyList());
+        }
+
+        Plan(long eventId, String title, long appointmentMillis, long departAtMillis,
+                boolean estimated, InfoThread.TransitDetails transit,
+                List<kr.ac.ssu.zette.route.RouteResult> alternatives) {
+            this(eventId, title, appointmentMillis, departAtMillis, estimated, transit, alternatives, null);
+        }
+
+        Plan(long eventId, String title, long appointmentMillis, long departAtMillis,
+                boolean estimated, InfoThread.TransitDetails transit,
+                List<kr.ac.ssu.zette.route.RouteResult> alternatives, EventItinerary itinerary) {
             this.eventId = eventId;
             this.title = title;
             this.appointmentMillis = appointmentMillis;
             this.departAtMillis = departAtMillis;
             this.estimated = estimated;
             this.transit = transit;
+            this.alternatives = alternatives;
+            this.itinerary = itinerary;
         }
 
         String occurrenceId() {
@@ -114,7 +151,20 @@ public final class CheckerThread implements Runnable, AutoCloseable {
     private final GpsReader gpsReader;
     private final RouteSource routes;
     private final Map<Long, CallerThread> callers = new HashMap<>();
+    private final Map<String, NotifiedPlan> notifiedPlans = new ConcurrentHashMap<>();
+    private volatile Plan checkerPlan;
+    private final RealtimeTransitApi realtime;
     private boolean closed;
+
+    private static final class NotifiedPlan {
+        final Plan plan;
+        final long sentAt;
+
+        NotifiedPlan(Plan plan, long sentAt) {
+            this.plan = plan;
+            this.sentAt = sentAt;
+        }
+    }
 
     // 기존 서비스에서 쓰는 위치·캘린더 조회용 생성자.
     public CheckerThread(Context context, GpsReader gpsReader) {
@@ -122,21 +172,30 @@ public final class CheckerThread implements Runnable, AutoCloseable {
     }
 
     public CheckerThread(Context context, GpsReader gpsReader, RouteSource routes) {
+        this(context, gpsReader, routes, null);
+    }
+
+    CheckerThread(Context context, GpsReader gpsReader, RouteSource routes, RealtimeTransitApi realtime) {
         this.context = context.getApplicationContext();
         this.gpsReader = gpsReader;
         this.routes = routes;
+        this.realtime = realtime;
     }
 
     @Override
     public void run() {
         if (context.checkSelfPermission(Manifest.permission.READ_CALENDAR)
                 != PackageManager.PERMISSION_GRANTED) {
+            checkerPlan = null;
             Log.w(TAG, "캘린더 읽기 권한이 없습니다.");
             return;
         }
 
         try {
             Event event = readEvent(context, System.currentTimeMillis(), null);
+            Plan previousEstimate = checkerPlan;
+            if (event == null || previousEstimate != null && (previousEstimate.eventId != event.id
+                    || previousEstimate.appointmentMillis != event.start)) checkerPlan = null;
             if (event == null || hasCaller(event.id)
                     || (routes != null && CallerThread.wasNotified(context, event))) {
                 return;
@@ -160,8 +219,9 @@ public final class CheckerThread implements Runnable, AutoCloseable {
                     event.destination, now, event.start).get(ROUTE_TIMEOUT, TimeUnit.MILLISECONDS);
             long resolvedAt = System.currentTimeMillis();
             if (!Thread.currentThread().isInterrupted() && resolvedAt < event.start) {
-                Plan plan = selectPlan(event, result, resolvedAt);
-                if (plan != null && plan.departAtMillis - resolvedAt <= CALLER_WINDOW) {
+                Plan plan = selectCallerPlan(event, result, resolvedAt);
+                checkerPlan = plan;
+                if (shouldStartCaller(plan, result, resolvedAt)) {
                     startCaller(event, plan);
                 }
             }
@@ -173,6 +233,13 @@ public final class CheckerThread implements Runnable, AutoCloseable {
         }
     }
 
+    static boolean shouldStartCaller(Plan plan, RouteResult result, long now) {
+        long target = plan == null ? 0 : plan.appointmentMillis;
+        if (result.primaryRoute != null) target -= RealtimeDeparturePlanner.ARRIVAL_MARGIN;
+        return plan != null && (plan.departAtMillis - now <= CALLER_WINDOW
+                || (result.arrivalTimeMillis != null && result.arrivalTimeMillis >= target - CALLER_WINDOW));
+    }
+
     private synchronized boolean hasCaller(long eventId) {
         callers.values().removeIf(caller -> !caller.isAlive());
         return closed || callers.containsKey(eventId);
@@ -180,15 +247,53 @@ public final class CheckerThread implements Runnable, AutoCloseable {
 
     private synchronized void startCaller(Event event, Plan plan) {
         if (closed || callers.containsKey(event.id)) return;
-        CallerThread caller = new CallerThread(context, gpsReader, routes, event, plan);
+        CallerThread caller = new CallerThread(context, gpsReader, routes, event, plan, realtime,
+                this::saveNotifiedPlan);
         callers.put(event.id, caller);
         caller.start();
     }
 
     synchronized void refreshCallers() {
+        checkerPlan = null;
         for (CallerThread caller : callers.values()) {
             caller.requestRefresh();
         }
+    }
+
+    private void saveNotifiedPlan(Plan plan, long sentAt) {
+        if (plan.itinerary == null || plan.itinerary.arrivalAt <= sentAt) return;
+        notifiedPlans.put(plan.occurrenceId(), new NotifiedPlan(plan, sentAt));
+        notifiedPlans.entrySet().removeIf(entry -> entry.getValue().plan.itinerary.arrivalAt <= sentAt);
+    }
+
+    synchronized InfoThread.CurrentEventInfo currentEventInfo(long now) {
+        notifiedPlans.entrySet().removeIf(entry -> entry.getValue().plan.itinerary.arrivalAt <= now);
+        NotifiedPlan latest = null;
+        for (NotifiedPlan entry : notifiedPlans.values()) {
+            if (entry.plan.itinerary.arrivalAt > now && (latest == null || entry.sentAt > latest.sentAt)) {
+                latest = entry;
+            }
+        }
+        if (latest != null) return InfoThread.CurrentEventInfo.fromPlan(latest.plan, "notified", now);
+
+        Plan active = null;
+        boolean hasActiveCaller = false;
+        for (CallerThread caller : callers.values()) {
+            if (!caller.isAlive()) continue;
+            hasActiveCaller = true;
+            Plan candidate = caller.currentPlan();
+            if (candidate != null && candidate.appointmentMillis > now
+                    && (active == null || candidate.appointmentMillis < active.appointmentMillis)) {
+                active = candidate;
+            }
+        }
+        if (hasActiveCaller) return InfoThread.CurrentEventInfo.fromPlan(active, "caller", now);
+        Plan estimate = checkerPlan;
+        if (estimate != null && estimate.appointmentMillis > now
+                && (estimate.itinerary == null || estimate.itinerary.arrivalAt > now)) {
+            return InfoThread.CurrentEventInfo.fromPlan(estimate, "checker", now);
+        }
+        return InfoThread.CurrentEventInfo.fromPlan(null, null, now);
     }
 
     @Override
@@ -200,10 +305,18 @@ public final class CheckerThread implements Runnable, AutoCloseable {
         callers.clear();
     }
 
+    static Plan selectCallerPlan(Event event, RouteResult result, long earliest) {
+        if (result.primaryRoute == null) return selectPlan(event, result, earliest);
+        long departure = event.start - RealtimeDeparturePlanner.ARRIVAL_MARGIN - result.totalTimeSec * 1000L;
+        return new Plan(event.id, event.title, event.start, departure, true, result.transit,
+                result.alternatives, EventItinerary.estimate(result.primaryRoute, departure));
+    }
+
     static Plan selectPlan(Event event, RouteResult result, long earliest) {
         if (result.trips == null) {
             long departAt = event.start - result.totalTimeSec * 1000L;
-            return new Plan(event.id, event.title, event.start, departAt, true, result.transit);
+            return new Plan(event.id, event.title, event.start, departAt, true, result.transit,
+                    result.alternatives);
         }
 
         Trip latest = null;
