@@ -1,12 +1,10 @@
 package kr.ac.ssu.zette;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 /** 팀의 장소 검색과 대중교통 API를 연결하는 Java 클래스. */
 public class TransitRouteSource implements CheckerThread.RouteSource {
-    private static final int DEPARTURE_SAMPLES = 5;
 
     public static final class Place {
         public final double longitude;
@@ -27,25 +25,31 @@ public class TransitRouteSource implements CheckerThread.RouteSource {
                 throw new IllegalStateException("일정 장소의 검색 결과가 없습니다.");
             }
             Place first = documents.get(0);
+            /*
+            // 출발 시각별 최대 5회 조회는 현재 사용하지 않는다.
             if (supportsDepartureTime()) {
                 return sampleRoutes(originLng, originLat, first, earliestDepartureMillis, arriveByMillis);
-            } else {
-                try {
-                    return getTransitRoute(originLng, originLat, first.longitude, first.latitude);
-                } catch (RuntimeException error) {
-                    return failedRoute(error);
-                }
+            }
+            */
+            try {
+                return getTransitRoute(originLng, originLat, first.longitude, first.latitude);
+            } catch (RuntimeException error) {
+                return failedRoute(error);
             }
         });
     }
 
+    /*
+    private static final int DEPARTURE_SAMPLES = 5;
+
     private CompletableFuture<CheckerThread.RouteResult> sampleRoutes(double originLng,
             double originLat, Place destination, long earliest, long arriveBy) {
         if (earliest >= arriveBy) {
-            return CompletableFuture.completedFuture(CheckerThread.RouteResult.scheduled(new ArrayList<>()));
+            return CompletableFuture.completedFuture(
+                    CheckerThread.RouteResult.scheduled(new java.util.ArrayList<>()));
         }
 
-        List<CompletableFuture<CheckerThread.RouteResult>> requests = new ArrayList<>();
+        List<CompletableFuture<CheckerThread.RouteResult>> requests = new java.util.ArrayList<>();
         long span = arriveBy - earliest - 1L;
         for (int sample = 0; sample < DEPARTURE_SAMPLES; sample++) {
             long offset = span * sample / DEPARTURE_SAMPLES;
@@ -54,7 +58,7 @@ public class TransitRouteSource implements CheckerThread.RouteSource {
         }
         return CompletableFuture.allOf(requests.toArray(new CompletableFuture<?>[0]))
                 .thenApply(ignored -> {
-                    List<CheckerThread.Trip> trips = new ArrayList<>();
+                    List<CheckerThread.Trip> trips = new java.util.ArrayList<>();
                     CheckerThread.RouteResult estimate = null;
                     boolean hasSchedule = false;
                     for (CompletableFuture<CheckerThread.RouteResult> request : requests) {
@@ -82,13 +86,14 @@ public class TransitRouteSource implements CheckerThread.RouteSource {
             return CompletableFuture.completedFuture(null);
         }
     }
+    */
 
     /** Override to return false when the team API accepts only the four coordinates. */
     protected boolean supportsDepartureTime() {
         return true;
     }
 
-    /** Override for an API that accepts origin and destination coordinates only. */
+    /** Overrides the single route lookup made by find(). */
     protected CompletableFuture<CheckerThread.RouteResult> getTransitRoute(
             double originLng, double originLat, double destinationLng, double destinationLat) {
         return unavailable("getTransitRoute");
@@ -107,7 +112,7 @@ public class TransitRouteSource implements CheckerThread.RouteSource {
      * 오버라이드에서 getRoute("TRANSIT", ...) 콜백을 Future로 전달한다.
      * 이동 시간만 있으면 RouteResult.estimate(totalTimeSec)를 반환한다.
      * 시간표 조회가 가능하면 요청한 출발 기준 시각 이후에 출발하는 API 응답을
-     * RouteResult.scheduled(trips)로 반환한다. 이 메서드는 다른 출발 기준 시각으로 동시에 호출될 수 있다.
+     * RouteResult.scheduled(trips)로 반환한다. 현재 find()에서는 이 오버로드를 사용하지 않는다.
      * UI에 필요한 정류장·도보·실시간 도착 정보는 Trip 또는 estimate의 TransitDetails에 담는다.
      */
     protected CompletableFuture<CheckerThread.RouteResult> getTransitRoute(
